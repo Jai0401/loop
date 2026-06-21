@@ -12,6 +12,7 @@
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { env } from '../config/env.js';
 import { logger } from '../core/logger.js';
 import type {
@@ -126,7 +127,7 @@ async function llmExtract(
         name: 'record_extraction',
         description:
           'Record the structured extraction of decisions, action items, and topics from the Slack conversation batch.',
-        input_schema: zodToToolSchema(ExtractionSchema) as Anthropic.Tool.InputSchema,
+        input_schema: zodToJsonSchema(ExtractionSchema) as Anthropic.Tool.InputSchema,
       },
     ],
     tool_choice: { type: 'tool', name: 'record_extraction' },
@@ -169,48 +170,4 @@ function renderBatch(batch: SlackConversationBatch): string {
     return `[${m.ts}] <@${m.user}>${thread}: ${m.text}`;
   });
   return `Channel: <#${batch.channel}>\nWindow: ${batch.oldest_ts} → ${batch.latest_ts}\n\n${lines.join('\n')}`;
-}
-
-/* ----------------------------- Schema helpers ----------------------------- */
-
-function zodToToolSchema(schema: z.ZodTypeAny): Record<string, unknown> {
-  return zodToJsonSchemaInternal(schema);
-}
-
-function zodToJsonSchemaInternal(schema: z.ZodTypeAny): Record<string, unknown> {
-  const def = schema._def as { typeName?: string; innerType?: z.ZodTypeAny; values?: unknown };
-  switch (def.typeName) {
-    case 'ZodObject': {
-      const shape = (schema as z.ZodObject<z.ZodRawShape>).shape;
-      const properties: Record<string, unknown> = {};
-      const required: string[] = [];
-      for (const [key, value] of Object.entries(shape)) {
-        properties[key] = zodToJsonSchemaInternal(value as z.ZodTypeAny);
-        const v = value as z.ZodTypeAny;
-        const innerDef = v._def as { typeName?: string };
-        if (innerDef.typeName !== 'ZodOptional' && innerDef.typeName !== 'ZodDefault') {
-          required.push(key);
-        }
-      }
-      return { type: 'object', properties, required };
-    }
-    case 'ZodArray':
-      return { type: 'array', items: zodToJsonSchemaInternal(def.innerType!) };
-    case 'ZodString':
-      return { type: 'string' };
-    case 'ZodNumber':
-      return { type: 'number' };
-    case 'ZodBoolean':
-      return { type: 'boolean' };
-    case 'ZodEnum':
-      return { type: 'string', enum: Object.values(def.values as Record<string, string>) };
-    case 'ZodOptional':
-      return zodToJsonSchemaInternal(def.innerType!);
-    case 'ZodDefault':
-      return zodToJsonSchemaInternal(def.innerType!);
-    case 'ZodNullable':
-      return zodToJsonSchemaInternal(def.innerType!);
-    default:
-      return { type: 'string' };
-  }
 }

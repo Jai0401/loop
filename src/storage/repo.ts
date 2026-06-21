@@ -6,6 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { getDb } from './db.js';
 import { embed } from './embeddings.js';
+import { logger } from '../core/logger.js';
 import type {
   ActionItem,
   ActionStatus,
@@ -338,19 +339,43 @@ export function findSimilarDecisions(
 }
 
 export function searchDecisionsFts(teamId: SlackTeamId, query: string, limit = 10): Decision[] {
-  const rows = getDb()
-    .prepare<[string, string, number], DecisionRow>(
-      `SELECT d.id, d.team_id, d.channel_id, d.source_message_ts, d.source_thread_ts,
-              d.summary, d.rationale, d.participants_json, d.confidence, d.supersedes_id, d.created_at
-       FROM decisions d
-       JOIN decisions_fts f ON f.rowid = (
-         SELECT rowid FROM decisions WHERE id = d.id
-       )
-       WHERE d.team_id = ? AND decisions_fts MATCH ?
-       LIMIT ?`,
-    )
-    .all(teamId, query, limit);
-  return rows.map(rowToDecision);
+  const db = getDb();
+  const safeQuery = sanitizeFtsQuery(query);
+  if (!safeQuery) return [];
+
+  try {
+    const rows = db
+      .prepare<[string, string, number], DecisionRow>(
+        `SELECT d.id, d.team_id, d.channel_id, d.source_message_ts, d.source_thread_ts,
+                d.summary, d.rationale, d.participants_json, d.confidence, d.supersedes_id, d.created_at
+         FROM decisions d
+         JOIN decisions_fts f ON f.rowid = (
+           SELECT rowid FROM decisions WHERE id = d.id
+         )
+         WHERE d.team_id = ? AND decisions_fts MATCH ?
+         LIMIT ?`,
+      )
+      .all(teamId, safeQuery, limit);
+    return rows.map(rowToDecision);
+  } catch (err) {
+    logger.warn({ err, query, safeQuery }, 'searchDecisionsFts failed');
+    return [];
+  }
+}
+
+/**
+ * Convert a free-form query into a safe FTS5 MATCH expression.
+ * Strips FTS5 operators (/, *, ", (, ), :, etc.), keeps alphanumeric + spaces,
+ * wraps each remaining word in quotes so FTS5 treats it as a literal token.
+ */
+function sanitizeFtsQuery(query: string): string {
+  const tokens = query
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  if (tokens.length === 0) return '';
+  // FTS5 prefix match: prefix each token with `*` for partial matching.
+  return tokens.map((t) => `"${t}"*`).join(' ');
 }
 
 /* ----------------------------- Actions ----------------------------- */
