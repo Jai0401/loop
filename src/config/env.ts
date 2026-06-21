@@ -15,6 +15,8 @@ const EnvSchema = z.object({
 
   // Anthropic (Claude)
   ANTHROPIC_API_KEY: z.string().optional().transform(stripEmpty),
+  ANTHROPIC_AUTH_TOKEN: z.string().optional().transform(stripEmpty),
+  ANTHROPIC_BASE_URL: z.string().optional().transform(stripEmpty),
   ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-6'),
 
   // Database
@@ -67,7 +69,7 @@ export function validateRuntimeMode(opts: { allowInTests?: boolean } = {}): void
     );
   }
 
-  if (!env.ANTHROPIC_API_KEY && !opts.allowInTests) {
-    console.warn('⚠️  ANTHROPIC_API_KEY not set — AI extraction will be skipped (dev mode only).');
+  if (!env.ANTHROPIC_API_KEY && !env.ANTHROPIC_AUTH_TOKEN && !opts.allowInTests) {
+    console.warn('⚠️  No Anthropic credentials set — AI extraction will fall back to heuristic mode.');
   }
 }

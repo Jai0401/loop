@@ -1,14 +1,58 @@
 /**
  * Slack message helpers — building Block Kit messages and posting them.
  *
- * Loop posts two kinds of messages proactively:
- *   1. "Surface" reply in a thread when a new top-level message references
+ * Loop posts three kinds of messages proactively:
+ *   1. Reaction feedback — 👀 on receipt, ✅ when extraction completes
+ *   2. "Surface" reply in a thread when a new top-level message references
  *      a past decision.
- *   2. Direct messages to action item owners when their items go overdue.
+ *   3. Direct messages to action item owners when their items go overdue.
  */
 import type { WebClient } from '@slack/web-api';
 import type { Block, KnownBlock } from '@slack/types';
+import { logger } from '../core/logger.js';
 import type { Decision } from '../core/types.js';
+
+/* --------------------------- Reactions --------------------------- */
+
+/**
+ * Add an emoji reaction to a message. Silent fail — reactions are nice-to-have,
+ * never block the main pipeline on a failed reaction.
+ */
+export async function addReaction(
+  client: WebClient,
+  channel: string,
+  timestamp: string,
+  emoji: string,
+): Promise<void> {
+  try {
+    await client.reactions.add({ channel, timestamp, name: emoji });
+  } catch (err) {
+    // Common: already_reacted (we added it twice). Don't log as error.
+    const code = (err as { data?: { error?: string } }).data?.error;
+    if (code !== 'already_reacted' && code !== 'message_not_found') {
+      logger.debug({ err, channel, timestamp, emoji }, 'reaction add failed');
+    }
+  }
+}
+
+/**
+ * Remove an emoji reaction. Same silent-fail semantics.
+ */
+export async function removeReaction(
+  client: WebClient,
+  channel: string,
+  timestamp: string,
+  emoji: string,
+): Promise<void> {
+  try {
+    await client.reactions.remove({ channel, timestamp, name: emoji });
+  } catch (err) {
+    const code = (err as { data?: { error?: string } }).data?.error;
+    if (code !== 'no_reaction' && code !== 'message_not_found') {
+      logger.debug({ err, channel, timestamp, emoji }, 'reaction remove failed');
+    }
+  }
+}
 
 export async function postSurfaceMessage(
   client: WebClient,

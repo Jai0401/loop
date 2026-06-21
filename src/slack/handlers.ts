@@ -1,30 +1,44 @@
 /**
- * Slack event handlers — the ingestion spine of Loop.
+ * Slack event handlers — ingestion spine of Loop.
  *
- * Pipeline: new message event → resolve channel + users → ingest message →
- *   fetch thread context (if any) → call AI extractor → write decisions/actions/topics →
- *   optionally surface related past decisions in the thread.
+ * Two responsibilities:
+ *   1. Passive message ingestion: every message gets stored, and the LLM
+ *      extractor pulls out decisions/actions/topics. No regex, no heuristics.
+ *   2. Proactive mention routing: when Loop is @-mentioned, we hand the
+ *      user's natural-language query to the LLM agent, which decides what
+ *      to do and replies conversationally.
+ *
+ * Reactions provide visual feedback only on @-mentions (passive messages
+ * stay quiet to avoid spam).
  */
 import type { App } from '@slack/bolt';
 import { extractFromBatch } from '../ai/extractor.js';
+import { runAgent, type AgentContext } from '../ai/agent.js';
 import { logger } from '../core/logger.js';
 import {
   createAction,
   createDecision,
-  findSimilarDecisions,
   findUserBySlackId,
   ingestMessage,
   recordProactiveEvent,
   upsertChannel,
+  upsertTeam,
   upsertUser,
 } from '../storage/repo.js';
 import { env } from '../config/env.js';
 import type { SlackMessage } from '../core/types.js';
-import { postSurfaceMessage } from './messages.js';
+import {
+  addReaction,
+  postSurfaceMessage,
+  removeReaction,
+} from './messages.js';
+
+const MAX_RECENT_FOR_AGENT = 15;
 
 export function registerHandlers(app: App): void {
+  /* ---------------- Passive message ingestion ---------------- */
+
   app.event('message', async ({ event, client, logger: slog }) => {
-    // Ignore messages from bots, edits, deletes, etc.
     if (event.subtype && event.subtype !== 'thread_broadcast') return;
     if (!('text' in event) || !event.text) return;
     if (!event.user) return; // bot messages have no user
@@ -36,44 +50,32 @@ export function registerHandlers(app: App): void {
     const slackUserId = event.user;
     const messageText: string = event.text;
 
-    try {
-      // 1. Resolve user info (cached)
-      let user = findUserBySlackId(slackUserId, teamId);
-      if (!user) {
-        const info = await client.users.info({ user: slackUserId });
-        if (info.ok && info.user) {
-          user = upsertUser({
-            slack_user_id: slackUserId,
-            slack_team_id: teamId,
-            display_name: info.user.profile?.display_name || info.user.name || slackUserId,
-            real_name: info.user.profile?.real_name,
-            avatar_url: info.user.profile?.image_192,
-          });
-        }
-      } else {
-        // refresh name opportunistically (cheap)
-        const info = await client.users.info({ user: slackUserId });
-        if (info.ok && info.user) {
-          upsertUser({
-            slack_user_id: slackUserId,
-            slack_team_id: teamId,
-            display_name: info.user.profile?.display_name || info.user.name || slackUserId,
-            real_name: info.user.profile?.real_name,
-            avatar_url: info.user.profile?.image_192,
-          });
-        }
-      }
+    // Only show reaction feedback when the user explicitly invoked Loop.
+    const authInfo = await client.auth.test();
+    const botUserId = authInfo.user_id ?? '';
+    const isMentioned = botUserId && messageText.includes(`<@${botUserId}>`);
+    const isAddressed = /^\s*loop\b/i.test(messageText);
+    const wantsFeedback = Boolean(isMentioned || isAddressed);
 
-      // 2. Resolve channel info (cached)
-      let channelName = channelId;
+    if (wantsFeedback) {
+      addReaction(client, channelId, ts, 'eyes').catch(() => {});
+    }
+
+    try {
+      upsertTeam(teamId, 'unknown');
+
+      // Resolve user info (cached)
+      const user = await ensureUser(client, slackUserId, teamId);
+      if (!user) return; // couldn't resolve user — bail silently
+
+      // Resolve channel info
       try {
         const cinfo = await client.conversations.info({ channel: channelId });
         if (cinfo.ok && cinfo.channel) {
-          channelName = cinfo.channel.name ?? channelId;
           upsertChannel({
             slack_channel_id: channelId,
             slack_team_id: teamId,
-            name: channelName,
+            name: cinfo.channel.name ?? channelId,
             is_private: cinfo.channel.is_private,
             is_archived: cinfo.channel.is_archived,
           });
@@ -82,7 +84,7 @@ export function registerHandlers(app: App): void {
         slog.warn({ err, channelId }, 'channel info failed');
       }
 
-      // 3. Ingest the message (idempotent on (channel, ts))
+      // Ingest the message (idempotent on (channel, ts))
       const ingested = ingestMessage({
         team_id: teamId,
         channel_id: channelId,
@@ -97,15 +99,9 @@ export function registerHandlers(app: App): void {
         return;
       }
 
-      // 4. Build the batch (this message + recent thread siblings for context)
+      // Build the batch — this message + recent thread siblings for context
       const batchMessages: SlackMessage[] = [
-        {
-          ts,
-          thread_ts: threadTs,
-          channel: channelId,
-          user: slackUserId,
-          text: event.text,
-        },
+        { ts, thread_ts: threadTs, channel: channelId, user: slackUserId, text: messageText },
       ];
 
       if (threadTs && threadTs !== ts) {
@@ -118,7 +114,7 @@ export function registerHandlers(app: App): void {
           if (replies.ok && replies.messages) {
             for (const m of replies.messages) {
               if (!('user' in m) || !m.user || !('text' in m) || !m.text || !m.ts) continue;
-              if (m.ts === ts) continue; // already added above
+              if (m.ts === ts) continue;
               batchMessages.push({
                 ts: m.ts,
                 thread_ts: m.thread_ts ?? threadTs,
@@ -135,7 +131,7 @@ export function registerHandlers(app: App): void {
 
       batchMessages.sort((a, b) => a.ts.localeCompare(b.ts));
 
-      // 5. AI extract
+      // LLM extraction
       const oldest_ts = batchMessages[0]?.ts ?? ts;
       const latest_ts = batchMessages[batchMessages.length - 1]?.ts ?? ts;
 
@@ -144,7 +140,7 @@ export function registerHandlers(app: App): void {
         { verbose: true },
       );
 
-      // 6. Persist decisions
+      // Persist decisions
       for (const d of extraction.decisions) {
         const participantIds = d.participant_slack_ids
           .map((sid) => findUserBySlackId(sid, teamId)?.id)
@@ -161,7 +157,7 @@ export function registerHandlers(app: App): void {
         });
       }
 
-      // 7. Persist action items
+      // Persist action items
       for (const a of extraction.action_items) {
         const ownerId = a.owner_slack_id
           ? findUserBySlackId(a.owner_slack_id, teamId)?.id
@@ -189,10 +185,24 @@ export function registerHandlers(app: App): void {
         'ingestion complete',
       );
 
-      // 8. Surface related past decisions if asked
-      if (env.LOOP_PROACTIVE_SURFACE && threadTs === ts) {
-        // only on top-level message in a thread
-        const similar = findSimilarDecisions(teamId, event.text, 3);
+      // Visual feedback: only when explicitly invoked
+      if (wantsFeedback) {
+        const foundCount = extraction.decisions.length + extraction.action_items.length;
+        if (foundCount > 0) {
+          removeReaction(client, channelId, ts, 'eyes').catch(() => {});
+          addReaction(client, channelId, ts, 'white_check_mark').catch(() => {});
+        } else if (extraction.topics.length > 0) {
+          removeReaction(client, channelId, ts, 'eyes').catch(() => {});
+          addReaction(client, channelId, ts, 'memo').catch(() => {});
+        } else {
+          removeReaction(client, channelId, ts, 'eyes').catch(() => {});
+          addReaction(client, channelId, ts, 'large_green_circle').catch(() => {});
+        }
+      }
+
+      // Proactive surface of related past decisions (only on top-level messages in a thread)
+      if (env.LOOP_PROACTIVE_SURFACE && threadTs === ts && extraction.decisions.length > 0) {
+        const similar = await findRelatedDecisions(teamId, extraction.decisions[0]!.summary);
         const strongMatches = similar.filter((s) => s.score > 0.45);
         if (strongMatches.length > 0) {
           await postSurfaceMessage(client, channelId, ts, strongMatches);
@@ -211,27 +221,109 @@ export function registerHandlers(app: App): void {
     }
   });
 
-  // When Loop is @-mentioned, treat as a query.
-  app.event('app_mention', async ({ event, client, say }) => {
-    if (!('text' in event) || !event.text) return;
-    const query = event.text.replace(/<@[^>]+>/g, '').trim();
-    const teamId = (await client.auth.test()).team_id!;
+  /* ---------------- @-mention: route to LLM agent ---------------- */
 
-    const similar = findSimilarDecisions(teamId, query, 5);
-    if (similar.length === 0) {
-      await say({
-        thread_ts: event.ts,
-        text: `:mag: No prior decisions found matching "${query}". I'll start tracking from this conversation.`,
-      });
-      return;
+  app.event('app_mention', async ({ event, client, say }) => {
+    logger.info({ ts: event.ts, channel: event.channel }, 'slack: app_mention received');
+    if (!('text' in event) || !event.text) return;
+    if (!event.user) return;
+
+    addReaction(client, event.channel, event.ts, 'eyes').catch(() => {});
+
+    const teamId = (await client.auth.test()).team_id!;
+    const query = event.text.replace(/<@[^>]+>/g, '').trim();
+    const userId = event.user;
+
+    // Resolve the invoker's display name
+    let userName = userId;
+    try {
+      const info = await client.users.info({ user: userId });
+      if (info.ok && info.user) {
+        userName = info.user.profile?.display_name || info.user.name || userId;
+      }
+    } catch {
+      // ignore
     }
 
-    const lines = similar
-      .map((d, i) => `${i + 1}. *${d.summary}* — _${d.confidence} confidence_`)
-      .join('\n');
-    await say({
-      thread_ts: event.ts,
-      text: `:sparkles: Found ${similar.length} related decision${similar.length === 1 ? '' : 's'}:\n${lines}`,
-    });
+    // Fetch recent channel context so the agent knows what's being discussed
+    const recent = await fetchRecentMessages(client, event.channel, 30, event.thread_ts ?? event.ts);
+
+    const ctx: AgentContext = {
+      team_id: teamId,
+      channel_id: event.channel,
+      user_id: userId,
+      user_name: userName,
+      recent_messages: recent,
+    };
+
+    try {
+      const result = await runAgent(query || 'hello', ctx, { verbose: true });
+      removeReaction(client, event.channel, event.ts, 'eyes').catch(() => {});
+      addReaction(client, event.channel, event.ts, 'white_check_mark').catch(() => {});
+
+      await say({
+        thread_ts: event.ts,
+        text: result.response,
+      });
+    } catch (err) {
+      logger.error({ err }, 'agent failed');
+      removeReaction(client, event.channel, event.ts, 'eyes').catch(() => {});
+      addReaction(client, event.channel, event.ts, 'warning').catch(() => {});
+      await say({
+        thread_ts: event.ts,
+        text: `:warning: Something went wrong while I was thinking. ${(err as Error).message ?? ''}`.trim(),
+      });
+    }
   });
+}
+
+/* ----------------------------- Helpers ----------------------------- */
+
+async function ensureUser(
+  client: import('@slack/web-api').WebClient,
+  slackUserId: string,
+  teamId: string,
+): Promise<{ id: string; display_name: string } | null> {
+  const existing = findUserBySlackId(slackUserId, teamId);
+  try {
+    const info = await client.users.info({ user: slackUserId });
+    if (!info.ok || !info.user) return existing ? { id: existing.id, display_name: existing.display_name } : null;
+    const display_name = info.user.profile?.display_name || info.user.name || slackUserId;
+    return upsertUser({
+      slack_user_id: slackUserId,
+      slack_team_id: teamId,
+      display_name,
+      real_name: info.user.profile?.real_name,
+      avatar_url: info.user.profile?.image_192,
+    });
+  } catch {
+    return existing ? { id: existing.id, display_name: existing.display_name } : null;
+  }
+}
+
+async function fetchRecentMessages(
+  client: import('@slack/web-api').WebClient,
+  channelId: string,
+  limit: number,
+  upToTs?: string,
+): Promise<Array<{ ts: string; user: string; text: string }>> {
+  try {
+    const res = await client.conversations.history({
+      channel: channelId,
+      limit,
+      ...(upToTs ? { latest: upToTs } : {}),
+    });
+    if (!res.ok || !res.messages) return [];
+    return res.messages
+      .filter((m): m is { ts: string; user?: string; text?: string } => Boolean(m.ts && m.text))
+      .map((m) => ({ ts: m.ts, user: m.user ?? 'unknown', text: m.text ?? '' }))
+      .reverse(); // oldest first
+  } catch {
+    return [];
+  }
+}
+
+async function findRelatedDecisions(teamId: string, query: string) {
+  const { findSimilarDecisions } = await import('../storage/repo.js');
+  return findSimilarDecisions(teamId, query, 3);
 }
