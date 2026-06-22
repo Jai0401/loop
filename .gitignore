@@ -1,13 +1,30 @@
-node_modules/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
 dist/
+
+# Strands agent state
 data/
 *.db
 *.db-shm
 *.db-wal
+
+# Env / secrets
 .env
 .env.local
+
+# OS
 .DS_Store
-*.log
+
+# Editor
 .vscode/
 .idea/
-coverage/
